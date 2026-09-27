@@ -1,0 +1,7 @@
+pandas
+scikit-learn
+lightgbm
+jellyfish
+rapidfuzz
+numpy
+tqdm
