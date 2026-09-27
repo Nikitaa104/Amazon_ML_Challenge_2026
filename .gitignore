@@ -1,0 +1,18 @@
+# Dataset files (too large for GitHub - up to 485 MB each)
+dataset/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Large intermediate artifacts
+*.pkl
+*.log
+
+# Virtual environments
+.venv/
+venv/
+
+# Output (generated at runtime)
+output/

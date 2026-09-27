@@ -155,6 +155,10 @@ def extract_candidate_features(
                 "pin_both_present",
                 "addr_token_overlap",
                 "country_exact_match",
+                # Step 3 new features
+                "addr_sim_x_name_dissim",
+                "name_high_addr_low",
+                "pin_match_city_diff",
             ]
         )
         return empty_df, fitted_vectorizers or (None, None)
@@ -183,6 +187,7 @@ def extract_candidate_features(
         addr_tokens_col = "address_tokens" if "address_tokens" in df.columns else addr_norm_col
         pin_col = "pin_code"
         country_col = "country"
+        city_col = "city"
 
         # Filter df to required_eids only for speed
         mask = df["entity_id"].astype(str).isin(required_eids)
@@ -198,9 +203,10 @@ def extract_candidate_features(
         a_tokens_list = sub_df[addr_tokens_col].fillna("").astype(str).tolist() if addr_tokens_col in sub_df.columns else a_norms
         pins = sub_df[pin_col].fillna("").astype(str).tolist() if pin_col in sub_df.columns else [""] * len(sub_df)
         countries = sub_df[country_col].fillna("").astype(str).tolist() if country_col in sub_df.columns else [""] * len(sub_df)
+        cities = sub_df[city_col].fillna("").astype(str).tolist() if city_col in sub_df.columns else [""] * len(sub_df)
 
-        for e_id, nn, ns, nt, an, at, pin, c in zip(
-            e_ids, n_norms, n_strippeds, n_tokens_list, a_norms, a_tokens_list, pins, countries
+        for e_id, nn, ns, nt, an, at, pin, c, city in zip(
+            e_ids, n_norms, n_strippeds, n_tokens_list, a_norms, a_tokens_list, pins, countries, cities
         ):
             if e_id not in entity_map:
                 entity_map[e_id] = {
@@ -211,6 +217,7 @@ def extract_candidate_features(
                     "address_tokens": set(at.split()),
                     "pin_code": pin.strip(),
                     "country": c.strip().lower(),
+                    "city": city.strip().lower(),
                 }
 
     # 2. Compute TF-IDF sparse matrix dot products in bulk for candidate pairs
@@ -252,6 +259,7 @@ def extract_candidate_features(
 
         pin1, pin2 = rec1["pin_code"], rec2["pin_code"]
         c1, c2 = rec1["country"], rec2["country"]
+        city1, city2 = rec1.get("city", ""), rec2.get("city", "")
 
         name_token_jaccard = compute_token_jaccard(nt1, nt2)
         name_levenshtein = compute_levenshtein_ratio(n1, n2)
@@ -274,6 +282,23 @@ def extract_candidate_features(
 
         country_exact_match = 1.0 if (c1 and c2 and c1 == c2) else 0.0
 
+        # --- Step 3: Four new features ---
+        # Feature 1: addr_sim * (1 - name_sim) — flags "same address, different entity" FP patterns
+        addr_sim_x_name_dissim = float(addr_tfidf_sim) * (1.0 - name_levenshtein)
+
+        # Feature 2: name_sim * (1 - addr_sim) — retains FNs with divergent address formatting
+        name_high_addr_low = name_levenshtein * (1.0 - float(addr_tfidf_sim))
+
+        # Feature 3: pin codes match but cities differ (data inconsistency / cross-branch FP signal)
+        valid_city1 = city1 and city1 not in ("none", "nan", "")
+        valid_city2 = city2 and city2 not in ("none", "nan", "")
+        pin_match_city_diff = 1.0 if (
+            pin_both_present == 1.0
+            and pin1 == pin2
+            and valid_city1 and valid_city2
+            and city1 != city2
+        ) else 0.0
+
         feat = {
             "source1_entity_id": id1,
             "candidate_entity_id": id2,
@@ -291,6 +316,10 @@ def extract_candidate_features(
             "pin_both_present": pin_both_present,
             "addr_token_overlap": addr_token_overlap,
             "country_exact_match": country_exact_match,
+            # Step 3 new features
+            "addr_sim_x_name_dissim": addr_sim_x_name_dissim,
+            "name_high_addr_low": name_high_addr_low,
+            "pin_match_city_diff": pin_match_city_diff,
         }
         feature_rows.append(feat)
 
