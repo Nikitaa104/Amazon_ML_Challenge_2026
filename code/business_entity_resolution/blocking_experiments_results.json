@@ -1,0 +1,15 @@
+[
+  {
+    "Key": "C",
+    "Experiment": "Exp C \u2014 Loosened caps 300 + NYSIIS + Address blocking (FULL NEW CONFIG)",
+    "max_token_postings": 5000,
+    "max_trigram_postings": 1500,
+    "max_cands_per_s1": 300,
+    "NYSIIS": true,
+    "AddrBlocking": true,
+    "RecallCeiling%": "51.18",
+    "AvgCands/S1": "299.5",
+    "TotalPairs": "1,497,716",
+    "Runtime(s)": "18573.9"
+  }
+]

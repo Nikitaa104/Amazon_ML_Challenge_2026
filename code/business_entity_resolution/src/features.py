@@ -1,18 +1,9 @@
-"""
-Feature extraction for business entity resolution.
-
-PERFORMANCE: All pairwise string similarity metrics are computed using batch/
-vectorized operations — NO Python for-loops per pair:
-  - Levenshtein / Jaro-Winkler: rapidfuzz list comps (fast C-level bindings)
-  - TF-IDF cosine: sparse element-wise matrix product
-  - Token Jaccard / overlap: vectorized Python over sets
-  - All scalar features: NumPy array ops
-"""
-
+import difflib
 import time
 from typing import Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 try:
@@ -21,7 +12,6 @@ try:
     HAS_RAPIDFUZZ = True
 except ImportError:
     HAS_RAPIDFUZZ = False
-    import difflib
 
 try:
     import jellyfish
@@ -29,10 +19,12 @@ try:
 except ImportError:
     HAS_JELLYFISH = False
 
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Single-pair helpers kept for backward-compat (not called in main pipeline)
-# ──────────────────────────────────────────────────────────────────────────────
 
 def compute_levenshtein_ratio(str1: str, str2: str) -> float:
     """Compute normalized Levenshtein ratio in range [0, 1]."""
@@ -40,7 +32,6 @@ def compute_levenshtein_ratio(str1: str, str2: str) -> float:
         return 1.0 if str1 == str2 else 0.0
     if HAS_RAPIDFUZZ:
         return fuzz.ratio(str1, str2) / 100.0
-    import difflib
     return difflib.SequenceMatcher(None, str1, str2).ratio()
 
 
@@ -52,7 +43,6 @@ def compute_jaro_winkler(str1: str, str2: str) -> float:
         return jellyfish.jaro_winkler_similarity(str1, str2)
     elif HAS_RAPIDFUZZ:
         return distance.JaroWinkler.similarity(str1, str2)
-    import difflib
     return difflib.SequenceMatcher(None, str1, str2).ratio()
 
 
@@ -74,133 +64,57 @@ def compute_token_overlap_ratio(tokens1: Set[str], tokens2: Set[str]) -> float:
     return intersection / min_len if min_len > 0 else 0.0
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# TF-IDF vectorizer fitting
-# ──────────────────────────────────────────────────────────────────────────────
-
 def fit_tfidf_vectorizers(
     all_dfs: List[pd.DataFrame],
-    max_sample_size: int = 50000,
+    max_sample_size: int = 200000,
 ) -> Tuple[TfidfVectorizer, TfidfVectorizer]:
-    """Fit shared character (2-4 n-gram) TF-IDF vectorizers on names and addresses."""
+    """Fit shared character (2-4 n-gram) TF-IDF vectorizers on names and addresses.
+    
+    Args:
+        all_dfs: List of DataFrames (S1, S2, S3) containing normalized columns.
+        max_sample_size: Maximum corpus sample size to fit TF-IDF efficiently.
+        
+    Returns:
+        Tuple of (name_vectorizer, address_vectorizer).
+    """
     start_t = time.perf_counter()
-    name_corpus: List[str] = []
-    addr_corpus: List[str] = []
+    name_corpus = []
+    addr_corpus = []
 
     for df in all_dfs:
         name_col = "name_norm" if "name_norm" in df.columns else "clean_name"
         addr_col = "address_norm" if "address_norm" in df.columns else "clean_address"
 
         if name_col in df.columns:
-            s = df[name_col].dropna().astype(str)
-            if len(s) > max_sample_size:
-                s = s.sample(max_sample_size, random_state=42)
-            name_corpus.extend(s.tolist())
-
+            name_corpus.extend(df[name_col].fillna("").astype(str).tolist())
         if addr_col in df.columns:
-            s = df[addr_col].dropna().astype(str)
-            if len(s) > max_sample_size:
-                s = s.sample(max_sample_size, random_state=42)
-            addr_corpus.extend(s.tolist())
+            addr_corpus.extend(df[addr_col].fillna("").astype(str).tolist())
 
     if not name_corpus:
         name_corpus = [""]
     if not addr_corpus:
         addr_corpus = [""]
 
-    # Using max_features to limit vocabulary size and significantly speed up 
-    # vectorization/dot products at scale
-    name_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=2, max_features=100_000)
+    if len(name_corpus) > max_sample_size:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(len(name_corpus), size=max_sample_size, replace=False)
+        name_corpus = [name_corpus[i] for i in idx]
+
+    if len(addr_corpus) > max_sample_size:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(len(addr_corpus), size=max_sample_size, replace=False)
+        addr_corpus = [addr_corpus[i] for i in idx]
+
+    name_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=2)
     name_vec.fit(name_corpus)
 
-    addr_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=2, max_features=100_000)
+    addr_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=2)
     addr_vec.fit(addr_corpus)
 
     elapsed = time.perf_counter() - start_t
-    print(f"Fit TF-IDF vectorizers on sample of {len(name_corpus):,} names & addresses in {elapsed:.2f}s.", flush=True)
+    print(f"Fit TF-IDF vectorizers on sample of {len(name_corpus):,} names & addresses in {elapsed:.2f}s.")
     return name_vec, addr_vec
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Batch string-similarity helpers (vectorized, NO per-pair Python loops)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _batch_levenshtein(queries: List[str], choices: List[str]) -> np.ndarray:
-    """Element-wise normalized Levenshtein ratio in [0,1] for parallel lists."""
-    n = len(queries)
-    if n == 0:
-        return np.array([], dtype=np.float32)
-
-    if HAS_RAPIDFUZZ:
-        # List comprehension calling C-level fuzz.ratio is very fast. 
-        # process.cdist computes a full NxN matrix which causes OOM.
-        ratios = [fuzz.ratio(q, c) for q, c in zip(queries, choices)]
-        return np.array(ratios, dtype=np.float32) / 100.0
-
-    import difflib
-    return np.array(
-        [difflib.SequenceMatcher(None, q, c).ratio() for q, c in zip(queries, choices)],
-        dtype=np.float32,
-    )
-
-
-def _batch_jaro_winkler(queries: List[str], choices: List[str]) -> np.ndarray:
-    """Element-wise Jaro-Winkler similarity in batch."""
-    n = len(queries)
-    if n == 0:
-        return np.array([], dtype=np.float32)
-
-    if HAS_RAPIDFUZZ:
-        scores = [distance.JaroWinkler.similarity(q, c) for q, c in zip(queries, choices)]
-        return np.array(scores, dtype=np.float32)
-
-    if HAS_JELLYFISH:
-        return np.array(
-            [jellyfish.jaro_winkler_similarity(q, c) for q, c in zip(queries, choices)],
-            dtype=np.float32,
-        )
-    import difflib
-    return np.array(
-        [difflib.SequenceMatcher(None, q, c).ratio() for q, c in zip(queries, choices)],
-        dtype=np.float32,
-    )
-
-
-def _batch_token_jaccard(tokens1_list: List[Set[str]], tokens2_list: List[Set[str]]) -> np.ndarray:
-    """Vectorized Jaccard similarity over parallel lists of token sets."""
-    n = len(tokens1_list)
-    if n == 0:
-        return np.array([], dtype=np.float32)
-    result = np.empty(n, dtype=np.float32)
-    for i, (t1, t2) in enumerate(zip(tokens1_list, tokens2_list)):
-        if not t1 or not t2:
-            result[i] = 0.0
-        else:
-            inter = len(t1 & t2)
-            union = len(t1 | t2)
-            result[i] = inter / union if union else 0.0
-    return result
-
-
-def _batch_token_overlap(tokens1_list: List[Set[str]], tokens2_list: List[Set[str]]) -> np.ndarray:
-    """Vectorized token overlap ratio relative to the smaller set."""
-    n = len(tokens1_list)
-    if n == 0:
-        return np.array([], dtype=np.float32)
-    result = np.empty(n, dtype=np.float32)
-    for i, (t1, t2) in enumerate(zip(tokens1_list, tokens2_list)):
-        if not t1 or not t2:
-            result[i] = 0.0
-        else:
-            inter = len(t1 & t2)
-            mn = min(len(t1), len(t2))
-            result[i] = inter / mn if mn else 0.0
-    return result
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Main feature extraction — fully vectorized, NO per-pair Python loop
-# ──────────────────────────────────────────────────────────────────────────────
 
 def extract_candidate_features(
     candidate_pairs: pd.DataFrame,
@@ -209,192 +123,181 @@ def extract_candidate_features(
     fitted_vectorizers: Optional[Tuple[TfidfVectorizer, TfidfVectorizer]] = None,
     show_progress: bool = True,
 ) -> Tuple[pd.DataFrame, Tuple[TfidfVectorizer, TfidfVectorizer]]:
+    """Extract pairwise numeric similarity features between Source 1 records and candidate records.
+    
+    Args:
+        candidate_pairs: DataFrame containing candidate pairs.
+        s1_df: Source 1 normalized DataFrame.
+        target_dfs: Dict mapping target source name ('source2', 'source3') to normalized DataFrames.
+        fitted_vectorizers: Optional pre-fitted vectorizers.
+        show_progress: Whether to show progress bars and stage timers.
+        
+    Returns:
+        Tuple of (feature_matrix_df, (name_vec, addr_vec)).
     """
-    Extract pairwise numeric similarity features between Source 1 records and
-    candidate records.  ALL string metrics are computed in bulk:
-      - TF-IDF cosine via sparse matrix element-wise product
-      - Levenshtein / Jaro-Winkler via rapidfuzz list comps
-      - Token Jaccard / overlap via vectorized Python over sets
-      - Scalar features via NumPy array ops
-    Per-stage wall-clock times are printed for profiling.
-    """
-    feature_start = time.perf_counter()
-
-    FEATURE_COLS = [
-        "source1_entity_id", "candidate_entity_id",
-        "name_token_jaccard", "name_levenshtein", "name_jaro_winkler",
-        "name_tfidf_cosine", "name_stripped_exact_match", "name_len_diff_norm",
-        "addr_token_jaccard", "addr_levenshtein", "addr_jaro_winkler",
-        "addr_tfidf_cosine", "pin_exact_match", "pin_both_present",
-        "addr_token_overlap", "country_exact_match",
-    ]
-
+    start_t = time.perf_counter()
     if candidate_pairs.empty:
-        return pd.DataFrame(columns=FEATURE_COLS), fitted_vectorizers or (None, None)
+        empty_df = pd.DataFrame(
+            columns=[
+                "source1_entity_id",
+                "candidate_entity_id",
+                "name_token_jaccard",
+                "name_levenshtein",
+                "name_jaro_winkler",
+                "name_tfidf_cosine",
+                "name_stripped_exact_match",
+                "name_len_diff_norm",
+                "addr_token_jaccard",
+                "addr_levenshtein",
+                "addr_jaro_winkler",
+                "addr_tfidf_cosine",
+                "pin_exact_match",
+                "pin_both_present",
+                "addr_token_overlap",
+                "country_exact_match",
+            ]
+        )
+        return empty_df, fitted_vectorizers or (None, None)
 
-    # ── 0. Fit / reuse vectorizers ────────────────────────────────────────────
-    t0 = time.perf_counter()
     all_dfs = [s1_df] + list(target_dfs.values())
     if fitted_vectorizers is None:
         name_vec, addr_vec = fit_tfidf_vectorizers(all_dfs)
     else:
         name_vec, addr_vec = fitted_vectorizers
-    print(f"  [features] vectorizer ready in {time.perf_counter()-t0:.2f}s", flush=True)
 
-    # ── 1. Build entity lookup map (only for required IDs) ────────────────────
-    t0 = time.perf_counter()
-    s1_col   = "source1_entity_id" if "source1_entity_id" in candidate_pairs.columns else "entity_id_1"
+    s1_col = "source1_entity_id" if "source1_entity_id" in candidate_pairs.columns else "entity_id_1"
     cand_col = "candidate_entity_id" if "candidate_entity_id" in candidate_pairs.columns else "entity_id_2"
 
-    id1_arr = candidate_pairs[s1_col].astype(str).to_numpy()
-    id2_arr = candidate_pairs[cand_col].astype(str).to_numpy()
-    required_eids = set(id1_arr) | set(id2_arr)
+    id1_list = candidate_pairs[s1_col].astype(str).tolist()
+    id2_list = candidate_pairs[cand_col].astype(str).tolist()
+
+    # Highly optimized: only build entity map for entity IDs present in candidate pairs!
+    required_eids = set(id1_list).union(set(id2_list))
 
     entity_map: Dict[str, dict] = {}
     for df in all_dfs:
-        name_norm_col     = "name_norm"      if "name_norm"      in df.columns else "clean_name"
-        name_stripped_col = "name_stripped"  if "name_stripped"  in df.columns else name_norm_col
-        name_tokens_col   = "name_tokens"    if "name_tokens"    in df.columns else name_norm_col
-        addr_norm_col     = "address_norm"   if "address_norm"   in df.columns else "clean_address"
-        addr_tokens_col   = "address_tokens" if "address_tokens" in df.columns else addr_norm_col
+        name_norm_col = "name_norm" if "name_norm" in df.columns else "clean_name"
+        name_stripped_col = "name_stripped" if "name_stripped" in df.columns else name_norm_col
+        name_tokens_col = "name_tokens" if "name_tokens" in df.columns else name_norm_col
+        addr_norm_col = "address_norm" if "address_norm" in df.columns else "clean_address"
+        addr_tokens_col = "address_tokens" if "address_tokens" in df.columns else addr_norm_col
+        pin_col = "pin_code"
+        country_col = "country"
 
-        sub = df[df["entity_id"].isin(required_eids)]
-        if sub.empty:
+        # Filter df to required_eids only for speed
+        mask = df["entity_id"].astype(str).isin(required_eids)
+        sub_df = df[mask]
+        if sub_df.empty:
             continue
 
-        for row in sub.itertuples(index=False):
-            eid = str(getattr(row, "entity_id"))
-            if eid in entity_map:
-                continue
-            nn  = str(getattr(row, name_norm_col,      "") or "")
-            ns  = str(getattr(row, name_stripped_col,   nn) or "")
-            nt  = str(getattr(row, name_tokens_col,     nn) or "")
-            an  = str(getattr(row, addr_norm_col,       "") or "")
-            at  = str(getattr(row, addr_tokens_col,     an) or "")
-            pin = str(getattr(row, "pin_code", "") or "").strip()
-            cty = str(getattr(row, "country",  "") or "").strip().lower()
-            entity_map[eid] = {
-                "name_norm":      nn,
-                "name_stripped":  ns,
-                "name_tokens":    set(nt.split()),
-                "address_norm":   an,
-                "address_tokens": set(at.split()),
-                "pin_code":       pin,
-                "country":        cty,
-            }
-    print(f"  [features] entity map ({len(entity_map):,} entities) in {time.perf_counter()-t0:.2f}s", flush=True)
+        e_ids = sub_df["entity_id"].astype(str).tolist()
+        n_norms = sub_df[name_norm_col].fillna("").astype(str).tolist()
+        n_strippeds = sub_df[name_stripped_col].fillna("").astype(str).tolist() if name_stripped_col in sub_df.columns else n_norms
+        n_tokens_list = sub_df[name_tokens_col].fillna("").astype(str).tolist() if name_tokens_col in sub_df.columns else n_norms
+        a_norms = sub_df[addr_norm_col].fillna("").astype(str).tolist()
+        a_tokens_list = sub_df[addr_tokens_col].fillna("").astype(str).tolist() if addr_tokens_col in sub_df.columns else a_norms
+        pins = sub_df[pin_col].fillna("").astype(str).tolist() if pin_col in sub_df.columns else [""] * len(sub_df)
+        countries = sub_df[country_col].fillna("").astype(str).tolist() if country_col in sub_df.columns else [""] * len(sub_df)
 
-    # ── 2. Gather aligned arrays for all pairs ────────────────────────────────
-    t0 = time.perf_counter()
-    EMPTY = {"name_norm": "", "name_stripped": "", "name_tokens": set(),
-             "address_norm": "", "address_tokens": set(), "pin_code": "", "country": ""}
+        for e_id, nn, ns, nt, an, at, pin, c in zip(
+            e_ids, n_norms, n_strippeds, n_tokens_list, a_norms, a_tokens_list, pins, countries
+        ):
+            if e_id not in entity_map:
+                entity_map[e_id] = {
+                    "name_norm": nn,
+                    "name_stripped": ns,
+                    "name_tokens": set(nt.split()),
+                    "address_norm": an,
+                    "address_tokens": set(at.split()),
+                    "pin_code": pin.strip(),
+                    "country": c.strip().lower(),
+                }
 
-    recs1 = [entity_map.get(eid, EMPTY) for eid in id1_arr]
-    recs2 = [entity_map.get(eid, EMPTY) for eid in id2_arr]
+    # 2. Compute TF-IDF sparse matrix dot products in bulk for candidate pairs
+    n1_texts = [entity_map[id1]["name_norm"] if id1 in entity_map else "" for id1 in id1_list]
+    n2_texts = [entity_map[id2]["name_norm"] if id2 in entity_map else "" for id2 in id2_list]
 
-    n1_texts  = [r["name_norm"]      for r in recs1]
-    n2_texts  = [r["name_norm"]      for r in recs2]
-    a1_texts  = [r["address_norm"]   for r in recs1]
-    a2_texts  = [r["address_norm"]   for r in recs2]
-    ns1_arr   = np.array([r["name_stripped"]  for r in recs1])
-    ns2_arr   = np.array([r["name_stripped"]  for r in recs2])
-    nt1_list  = [r["name_tokens"]    for r in recs1]
-    nt2_list  = [r["name_tokens"]    for r in recs2]
-    at1_list  = [r["address_tokens"] for r in recs1]
-    at2_list  = [r["address_tokens"] for r in recs2]
-    pin1_arr  = np.array([r["pin_code"] for r in recs1])
-    pin2_arr  = np.array([r["pin_code"] for r in recs2])
-    cty1_arr  = np.array([r["country"]  for r in recs1])
-    cty2_arr  = np.array([r["country"]  for r in recs2])
-    n_len1    = np.array([len(t) for t in n1_texts], dtype=np.float32)
-    n_len2    = np.array([len(t) for t in n2_texts], dtype=np.float32)
-    print(f"  [features] aligned {len(id1_arr):,} pairs in {time.perf_counter()-t0:.2f}s", flush=True)
+    a1_texts = [entity_map[id1]["address_norm"] if id1 in entity_map else "" for id1 in id1_list]
+    a2_texts = [entity_map[id2]["address_norm"] if id2 in entity_map else "" for id2 in id2_list]
 
-    # ── 3. TF-IDF cosine (sparse element-wise product, no loop) ──────────────
-    t0 = time.perf_counter()
-    # Batch transform (fast)
+    # Vectorized TF-IDF cosine similarity via sparse matrix multiplication
     name_mat1 = name_vec.transform(n1_texts)
     name_mat2 = name_vec.transform(n2_texts)
-    
-    # We must explicitly cast to csr_matrix before multiply to avoid inefficient 
-    # dense operations depending on scikit-learn version
-    from scipy.sparse import csr_matrix
-    if not isinstance(name_mat1, csr_matrix): name_mat1 = name_mat1.tocsr()
-    if not isinstance(name_mat2, csr_matrix): name_mat2 = name_mat2.tocsr()
-    
-    # Multiply element-wise then sum rows (fast exact cosine distance for sparse matrices)
-    name_tfidf_cosines = np.asarray(name_mat1.multiply(name_mat2).sum(axis=1)).ravel().astype(np.float32)
+    name_tfidf_cosines = np.asarray(name_mat1.multiply(name_mat2).sum(axis=1)).ravel()
 
     addr_mat1 = addr_vec.transform(a1_texts)
     addr_mat2 = addr_vec.transform(a2_texts)
-    if not isinstance(addr_mat1, csr_matrix): addr_mat1 = addr_mat1.tocsr()
-    if not isinstance(addr_mat2, csr_matrix): addr_mat2 = addr_mat2.tocsr()
-    addr_tfidf_cosines = np.asarray(addr_mat1.multiply(addr_mat2).sum(axis=1)).ravel().astype(np.float32)
-    print(f"  [features] TF-IDF cosine in {time.perf_counter()-t0:.2f}s", flush=True)
+    addr_tfidf_cosines = np.asarray(addr_mat1.multiply(addr_mat2).sum(axis=1)).ravel()
 
-    # ── 4. Batch Levenshtein ─────────────────────────────────────────────────
-    t0 = time.perf_counter()
-    name_lev = _batch_levenshtein(n1_texts, n2_texts)
-    addr_lev = _batch_levenshtein(a1_texts, a2_texts)
-    print(f"  [features] Levenshtein in {time.perf_counter()-t0:.2f}s", flush=True)
+    # 3. Compute remaining string features over candidate pair tuples
+    feature_rows = []
+    iterator = zip(id1_list, id2_list, name_tfidf_cosines, addr_tfidf_cosines)
 
-    # ── 5. Batch Jaro-Winkler ────────────────────────────────────────────────
-    t0 = time.perf_counter()
-    name_jw = _batch_jaro_winkler(n1_texts, n2_texts)
-    addr_jw = _batch_jaro_winkler(a1_texts, a2_texts)
-    print(f"  [features] Jaro-Winkler in {time.perf_counter()-t0:.2f}s", flush=True)
+    if show_progress and HAS_TQDM:
+        iterator = tqdm(iterator, total=len(candidate_pairs), desc=f"Extracting features ({len(candidate_pairs):,} candidate pairs)")
 
-    # ── 6. Token Jaccard & overlap (vectorized over sets) ────────────────────
-    t0 = time.perf_counter()
-    name_jaccard = _batch_token_jaccard(nt1_list, nt2_list)
-    addr_jaccard = _batch_token_jaccard(at1_list, at2_list)
-    addr_overlap = _batch_token_overlap(at1_list, at2_list)
-    print(f"  [features] Jaccard/overlap in {time.perf_counter()-t0:.2f}s", flush=True)
+    for id1, id2, name_tfidf_sim, addr_tfidf_sim in iterator:
+        rec1 = entity_map.get(id1, {})
+        rec2 = entity_map.get(id2, {})
 
-    # ── 7. Scalar features (NumPy vectorized) ────────────────────────────────
-    t0 = time.perf_counter()
-    name_exact    = (ns1_arr == ns2_arr).astype(np.float32)
-    max_n_len     = np.maximum(n_len1, n_len2)
-    max_n_len[max_n_len == 0] = 1.0
-    name_len_diff = np.abs(n_len1 - n_len2) / max_n_len
+        if not rec1 or not rec2:
+            continue
 
-    invalid_vals = {"", "none", "nan"}
-    valid_pin1   = np.array([p.lower() not in invalid_vals for p in pin1_arr], dtype=np.float32)
-    valid_pin2   = np.array([p.lower() not in invalid_vals for p in pin2_arr], dtype=np.float32)
-    pin_both     = valid_pin1 * valid_pin2
-    pin_exact    = pin_both * (pin1_arr == pin2_arr).astype(np.float32)
-    country_match = ((cty1_arr != "") & (cty2_arr != "") & (cty1_arr == cty2_arr)).astype(np.float32)
-    print(f"  [features] scalar features in {time.perf_counter()-t0:.2f}s", flush=True)
+        n1, n2 = rec1["name_norm"], rec2["name_norm"]
+        ns1, ns2 = rec1["name_stripped"], rec2["name_stripped"]
+        nt1, nt2 = rec1["name_tokens"], rec2["name_tokens"]
 
-    # ── 8. Assemble output DataFrame ──────────────────────────────────────────
-    t0 = time.perf_counter()
-    feature_df = pd.DataFrame({
-        "source1_entity_id":         id1_arr,
-        "candidate_entity_id":       id2_arr,
-        "name_token_jaccard":        name_jaccard,
-        "name_levenshtein":          name_lev,
-        "name_jaro_winkler":         name_jw,
-        "name_tfidf_cosine":         name_tfidf_cosines,
-        "name_stripped_exact_match": name_exact,
-        "name_len_diff_norm":        name_len_diff,
-        "addr_token_jaccard":        addr_jaccard,
-        "addr_levenshtein":          addr_lev,
-        "addr_jaro_winkler":         addr_jw,
-        "addr_tfidf_cosine":         addr_tfidf_cosines,
-        "pin_exact_match":           pin_exact,
-        "pin_both_present":          pin_both,
-        "addr_token_overlap":        addr_overlap,
-        "country_exact_match":       country_match,
-    })
-    print(f"  [features] DataFrame assembled in {time.perf_counter()-t0:.2f}s", flush=True)
+        a1, a2 = rec1["address_norm"], rec2["address_norm"]
+        at1, at2 = rec1["address_tokens"], rec2["address_tokens"]
 
-    total_elapsed = time.perf_counter() - feature_start
-    rate = len(feature_df) / total_elapsed if total_elapsed > 0 else 0
-    print(
-        f"Extracted features for {len(feature_df):,} pairs in {total_elapsed:.2f}s "
-        f"({rate:,.0f} pairs/s).",
-        flush=True,
-    )
+        pin1, pin2 = rec1["pin_code"], rec2["pin_code"]
+        c1, c2 = rec1["country"], rec2["country"]
+
+        name_token_jaccard = compute_token_jaccard(nt1, nt2)
+        name_levenshtein = compute_levenshtein_ratio(n1, n2)
+        name_jaro_winkler = compute_jaro_winkler(n1, n2)
+
+        name_stripped_exact_match = 1.0 if (ns1 and ns2 and ns1 == ns2) else 0.0
+        max_n_len = max(len(n1), len(n2), 1)
+        name_len_diff_norm = abs(len(n1) - len(n2)) / max_n_len
+
+        addr_token_jaccard = compute_token_jaccard(at1, at2)
+        addr_levenshtein = compute_levenshtein_ratio(a1, a2)
+        addr_jaro_winkler = compute_jaro_winkler(a1, a2)
+
+        valid_pin1 = pin1 and pin1.lower() not in ("none", "nan", "")
+        valid_pin2 = pin2 and pin2.lower() not in ("none", "nan", "")
+
+        pin_both_present = 1.0 if (valid_pin1 and valid_pin2) else 0.0
+        pin_exact_match = 1.0 if (pin_both_present == 1.0 and pin1 == pin2) else 0.0
+        addr_token_overlap = compute_token_overlap_ratio(at1, at2)
+
+        country_exact_match = 1.0 if (c1 and c2 and c1 == c2) else 0.0
+
+        feat = {
+            "source1_entity_id": id1,
+            "candidate_entity_id": id2,
+            "name_token_jaccard": name_token_jaccard,
+            "name_levenshtein": name_levenshtein,
+            "name_jaro_winkler": name_jaro_winkler,
+            "name_tfidf_cosine": float(name_tfidf_sim),
+            "name_stripped_exact_match": name_stripped_exact_match,
+            "name_len_diff_norm": name_len_diff_norm,
+            "addr_token_jaccard": addr_token_jaccard,
+            "addr_levenshtein": addr_levenshtein,
+            "addr_jaro_winkler": addr_jaro_winkler,
+            "addr_tfidf_cosine": float(addr_tfidf_sim),
+            "pin_exact_match": pin_exact_match,
+            "pin_both_present": pin_both_present,
+            "addr_token_overlap": addr_token_overlap,
+            "country_exact_match": country_exact_match,
+        }
+        feature_rows.append(feat)
+
+    feature_df = pd.DataFrame(feature_rows)
+    elapsed = time.perf_counter() - start_t
+    if show_progress:
+        print(f"Extracted features for {len(feature_df):,} pairs in {elapsed:.2f}s ({len(feature_df)/elapsed:,.0f} pairs/s).")
 
     return feature_df, (name_vec, addr_vec)
 
