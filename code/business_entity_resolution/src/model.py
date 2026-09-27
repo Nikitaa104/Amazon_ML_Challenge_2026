@@ -200,11 +200,18 @@ def train_model(
     print(f"Group Split: {len(train_idx):,} train pairs, {len(val_idx):,} validation pairs.")
     print(f"Validation set covers {len(val_s1_ids):,} unique Source 1 entities.")
 
+    # Compute scale_pos_weight from training set to handle ~160:1 class imbalance
+    n_neg = int((y.iloc[train_idx] == 0).sum())
+    n_pos = int((y.iloc[train_idx] == 1).sum())
+    scale_pos_weight = max(1.0, n_neg / n_pos) if n_pos > 0 else 1.0
+    print(f"Class imbalance: {n_neg:,} neg / {n_pos:,} pos  =>  scale_pos_weight={scale_pos_weight:.1f}")
+
     lgb_params = {
         "n_estimators": 200,
         "learning_rate": 0.05,
         "max_depth": 6,
         "num_leaves": 31,
+        "scale_pos_weight": scale_pos_weight,
         "random_state": random_state,
         "verbose": -1,
         "n_jobs": -1,

@@ -94,6 +94,23 @@ def get_address_trigrams(text: str) -> Set[str]:
     return {no_space[i : i + 3] for i in range(len(no_space) - 2)}
 
 
+def get_address_ngram_keys(addr_tokens_str: str) -> Set[str]:
+    """Generate char 3-grams from normalized street/locality tokens (length >= 4, non-stopword).
+    Catches street name fuzzy matches regardless of house/building prefix variations.
+    """
+    if not addr_tokens_str:
+        return set()
+    ngrams = set()
+    tokens = [
+        t for t in addr_tokens_str.split()
+        if t not in ADDRESS_STOPWORDS and len(t) >= 4 and not t.isdigit()
+    ]
+    for token in tokens[:5]:
+        for i in range(len(token) - 2):
+            ngrams.add(token[i : i + 3])
+    return ngrams
+
+
 class BlockingIndex:
     """Inverted index data structure for multi-key candidate blocking.
 
@@ -141,11 +158,13 @@ class BlockingIndex:
         # Address-based indices (independent signal)
         self.addr_token_index: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
         self.addr_trigram_index: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+        self.addr_ngram_index: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
 
         self.high_freq_tokens: Set[str] = set(GENERIC_STOPWORDS)
         self.high_freq_addr_tokens: Set[str] = set(ADDRESS_STOPWORDS)
         self.pruned_trigrams: Set[str] = set()
         self.pruned_addr_trigrams: Set[str] = set()
+        self.pruned_addr_ngrams: Set[str] = set()
 
     def build_index(self, target_dfs: Dict[str, pd.DataFrame], show_progress: bool = True) -> float:
         """Build inverted indices across target DataFrames using fast tuple iteration."""
@@ -278,6 +297,16 @@ class BlockingIndex:
                             else:
                                 self.pruned_addr_trigrams.add(tg)
                                 del self.addr_trigram_index[tg]
+
+                    # 7. Address token n-grams (shared 3-gram tokens on normalized street name)
+                    for ng in get_address_ngram_keys(addr_tokens_str):
+                        if ng not in self.pruned_addr_ngrams:
+                            lst = self.addr_ngram_index[ng]
+                            if len(lst) < self.max_trigram_postings:
+                                lst.append(item)
+                            else:
+                                self.pruned_addr_ngrams.add(ng)
+                                del self.addr_ngram_index[ng]
 
         elapsed = time.perf_counter() - start_t
         if show_progress:
@@ -429,6 +458,12 @@ def generate_candidate_pairs(
                 if tg not in index.pruned_addr_trigrams:
                     for cand_id, source in index.addr_trigram_index.get(tg, []):
                         _add(cand_id, source, "addr_trigram")
+
+            # 7. Address token n-gram blocking (shared 3-grams on normalized street name)
+            for ng in get_address_ngram_keys(addr_tokens_str):
+                if ng not in index.pruned_addr_ngrams:
+                    for cand_id, source in index.addr_ngram_index.get(ng, []):
+                        _add(cand_id, source, "addr_token_ngram")
 
         # Rank by number of distinct blocking keys fired (more = stronger evidence)
         # and cap at max_candidates_per_s1

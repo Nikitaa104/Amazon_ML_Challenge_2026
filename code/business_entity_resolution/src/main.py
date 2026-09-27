@@ -17,9 +17,9 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["train", "predict", "validate", "all"],
+        choices=["train", "predict", "validate", "error_analysis", "all"],
         default="all",
-        help="Execution mode: 'train' to train model, 'predict' to run inference, 'validate' to run submission validator, or 'all'.",
+        help="Execution mode: 'train' to train model, 'predict' to run inference, 'validate' to run submission validator, 'error_analysis' for validation diagnostics, or 'all'.",
     )
     parser.add_argument(
         "--dataset_dir",
@@ -113,6 +113,15 @@ def main():
         except FileNotFoundError as e:
             print(f"Inference error: {e}")
             sys.exit(1)
+
+    if args.mode == "error_analysis":
+        from src.error_analysis import run_error_analysis
+        run_error_analysis(
+            dataset_dir=str(dataset_path),
+            model_path=args.model_path,
+            output_report_path="reports/error_analysis.csv",
+            sample_n=args.sample_n or 5000,
+        )
 
     if args.mode in ["validate", "predict", "all"]:
         print("==================== STAGE 3: VALIDATING SUBMISSION FILES ====================")
